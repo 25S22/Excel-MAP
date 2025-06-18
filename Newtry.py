@@ -20,16 +20,36 @@ IP_COLUMN = 'IP'
 
 # 5) QRadar details:
 QRADAR_HOST = 'https://your-qradar-host'
-QRADAR_USERNAME = 'your-username'
-QRADAR_PASSWORD = 'your-password'
+QRADAR_USERNAME = 'your-username'       # Optional: if using Basic Auth
+QRADAR_PASSWORD = 'your-password'       # Optional: if using Basic Auth
 
-# 6) SSL verification (set to False for testing; in prod, you should verify SSL):
+# 6) SEC token for QRadar API (preferred). Generate via Admin → Authorized Services.
+#    If provided, every request will include header 'SEC': SEC_TOKEN.
+#    If blank or None, Basic Auth (username/password) may be used if supported.
+SEC_TOKEN = 'your-sec-token-here'  # e.g., 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
+
+# 7) SSL verification (set to False for testing; in prod, you should verify SSL):
 VERIFY_SSL = False
 
-# 7) Inactivity threshold (days) to consider a log source “might be disabled”
+# 8) Inactivity threshold (days) to consider a log source “might be disabled”
 INACTIVITY_THRESHOLD_DAYS = 30  # e.g., 30 days ~ 1 month
 
 # ─── END CONFIGURATION ─────────────────────────────────────────────────────────
+
+
+def _build_auth_headers():
+    """
+    Build headers dict for authentication:
+    - Always include 'Accept': 'application/json'
+    - If SEC_TOKEN is set, include 'SEC': SEC_TOKEN
+    - For POST with JSON, also include 'Content-Type': 'application/json'
+    """
+    headers = {
+        'Accept': 'application/json',
+    }
+    if SEC_TOKEN:
+        headers['SEC'] = SEC_TOKEN
+    return headers
 
 
 def test_qradar_connection(qradar_host, username, password):
@@ -39,19 +59,27 @@ def test_qradar_connection(qradar_host, username, password):
     test_endpoint = f"{qradar_host}/api/help/versions"
 
     try:
+        headers = _build_auth_headers()
+        # If using Basic Auth, pass auth=(username,password); else omit or set to None
+        auth = (username, password) if username and password else None
         resp = requests.get(
             test_endpoint,
-            auth=(username, password),
+            auth=auth,
             verify=VERIFY_SSL,
             timeout=10,
-            headers={'Accept': 'application/json'}
+            headers=headers
         )
         print(f"  → GET {test_endpoint} returned {resp.status_code}")
         if resp.status_code == 200:
             print("✅ QRadar connection successful!")
             return True
         elif resp.status_code == 401:
-            print("❌ Authentication failed! Check username/password.")
+            print("❌ Authentication failed! Check SEC token or username/password.")
+            # Print response body for clues
+            try:
+                print("    Response JSON:", resp.json())
+            except:
+                print("    Response text:", resp.text)
             return False
         else:
             print(f"⚠️ Unexpected response: {resp.status_code} - {resp.text}")
@@ -78,15 +106,20 @@ def _start_aql_search(qradar_host, username, password, query):
     """
     Start an Ariel (AQL) search. Returns search_id or None.
     Endpoint: POST /api/ariel/searches with JSON {"query_expression": "<AQL>"}.
+    Include SEC header if provided. 3
     """
     endpoint = f"{qradar_host.rstrip('/')}/api/ariel/searches"
+    headers = _build_auth_headers()
+    # Ensure JSON content type
+    headers['Content-Type'] = 'application/json'
+    auth = (username, password) if username and password else None
     try:
         resp = requests.post(
             endpoint,
-            auth=(username, password),
+            auth=auth,
             verify=VERIFY_SSL,
             timeout=30,
-            headers={'Accept': 'application/json', 'Content-Type': 'application/json'},
+            headers=headers,
             json={'query_expression': query}
         )
         print(f"  → POST {endpoint} returned {resp.status_code}")
@@ -111,17 +144,20 @@ def _start_aql_search(qradar_host, username, password, query):
 def _get_search_results(qradar_host, username, password, search_id, poll_interval=2, max_polls=15):
     """
     Poll for Ariel search results. Returns the JSON dict when 'events' found or empty dict.
+    Include SEC header if provided.
     """
     endpoint = f"{qradar_host.rstrip('/')}/api/ariel/searches/{search_id}/results"
+    headers = _build_auth_headers()
+    auth = (username, password) if username and password else None
     for attempt in range(max_polls):
         time.sleep(poll_interval)
         try:
             resp = requests.get(
                 endpoint,
-                auth=(username, password),
+                auth=auth,
                 verify=VERIFY_SSL,
                 timeout=30,
-                headers={'Accept': 'application/json'}
+                headers=headers
             )
             print(f"  → GET {endpoint} returned {resp.status_code}")
             if resp.status_code == 200:
@@ -142,6 +178,7 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
     including the actual last event timestamp, days since last event,
     and a flag if inactive beyond threshold.
     Uses GET /api/config/event_sources/log_source_management/log_sources?filter=... .
+    Include SEC header if provided.
     """
     filter_key = 'ip_address' if is_ip else 'name'
     # Construct exactly one filter parameter
@@ -149,15 +186,17 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
     ls_endpoint = f"{qradar_host.rstrip('/')}/api/config/event_sources/log_source_management/log_sources"
 
     try:
-        # Correct: exactly one 'filter' parameter in params
+        headers = _build_auth_headers()
+        auth = (username, password) if username and password else None
         resp = requests.get(
             ls_endpoint,
             params={'filter': query_filter},
-            auth=(username, password),
+            auth=auth,
             verify=VERIFY_SSL,
             timeout=30,
-            headers={'Accept': 'application/json'}
+            headers=headers
         )
+        # Print for debugging; in production you may reduce verbosity
         print(f"  → GET {ls_endpoint}?filter={query_filter} returned {resp.status_code}")
         if resp.status_code != 200:
             if resp.status_code == 422:
@@ -298,7 +337,7 @@ def main():
     if not VERIFY_SSL:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-    print("🚀 Starting QRadar Log Source Checker with last-event timestamp and inactivity flag...")
+    print("🚀 Starting QRadar Log Source Checker with SEC token support, last-event timestamp and inactivity flag...")
 
     # Test connection
     if not test_qradar_connection(QRADAR_HOST, QRADAR_USERNAME, QRADAR_PASSWORD):
