@@ -20,36 +20,16 @@ IP_COLUMN = 'IP'
 
 # 5) QRadar details:
 QRADAR_HOST = 'https://your-qradar-host'
-QRADAR_USERNAME = 'your-username'       # Optional: if using Basic Auth
-QRADAR_PASSWORD = 'your-password'       # Optional: if using Basic Auth
+QRADAR_USERNAME = 'your-username'
+QRADAR_PASSWORD = 'your-password'
 
-# 6) SEC token for QRadar API (preferred). Generate via Admin → Authorized Services.
-#    If provided, every request will include header 'SEC': SEC_TOKEN.
-#    If blank or None, Basic Auth (username/password) may be used if supported.
-SEC_TOKEN = 'your-sec-token-here'  # e.g., 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
-
-# 7) SSL verification (set to False for testing; in prod, you should verify SSL):
+# 6) SSL verification (set to False for testing; in prod, you should verify SSL):
 VERIFY_SSL = False
 
-# 8) Inactivity threshold (days) to consider a log source “might be disabled”
+# 7) Inactivity threshold (days) to consider a log source “might be disabled”
 INACTIVITY_THRESHOLD_DAYS = 30  # e.g., 30 days ~ 1 month
 
 # ─── END CONFIGURATION ─────────────────────────────────────────────────────────
-
-
-def _build_auth_headers():
-    """
-    Build headers dict for authentication:
-    - Always include 'Accept': 'application/json'
-    - If SEC_TOKEN is set, include 'SEC': SEC_TOKEN
-    - For POST with JSON, also include 'Content-Type': 'application/json'
-    """
-    headers = {
-        'Accept': 'application/json',
-    }
-    if SEC_TOKEN:
-        headers['SEC'] = SEC_TOKEN
-    return headers
 
 
 def test_qradar_connection(qradar_host, username, password):
@@ -59,23 +39,19 @@ def test_qradar_connection(qradar_host, username, password):
     test_endpoint = f"{qradar_host}/api/help/versions"
 
     try:
-        headers = _build_auth_headers()
-        # If using Basic Auth, pass auth=(username,password); else omit or set to None
-        auth = (username, password) if username and password else None
         resp = requests.get(
             test_endpoint,
-            auth=auth,
+            auth=(username, password),
             verify=VERIFY_SSL,
             timeout=10,
-            headers=headers
+            headers={'Accept': 'application/json'}
         )
         print(f"  → GET {test_endpoint} returned {resp.status_code}")
         if resp.status_code == 200:
             print("✅ QRadar connection successful!")
             return True
         elif resp.status_code == 401:
-            print("❌ Authentication failed! Check SEC token or username/password.")
-            # Print response body for clues
+            print("❌ Authentication failed! Check username/password.")
             try:
                 print("    Response JSON:", resp.json())
             except:
@@ -102,101 +78,29 @@ def _empty_details():
     }
 
 
-def _start_aql_search(qradar_host, username, password, query):
-    """
-    Start an Ariel (AQL) search. Returns search_id or None.
-    Endpoint: POST /api/ariel/searches with JSON {"query_expression": "<AQL>"}.
-    Include SEC header if provided. 3
-    """
-    endpoint = f"{qradar_host.rstrip('/')}/api/ariel/searches"
-    headers = _build_auth_headers()
-    # Ensure JSON content type
-    headers['Content-Type'] = 'application/json'
-    auth = (username, password) if username and password else None
-    try:
-        resp = requests.post(
-            endpoint,
-            auth=auth,
-            verify=VERIFY_SSL,
-            timeout=30,
-            headers=headers,
-            json={'query_expression': query}
-        )
-        print(f"  → POST {endpoint} returned {resp.status_code}")
-        if resp.status_code == 201:
-            search_id = resp.json().get('search_id')
-            print(f"    AQL search started, search_id={search_id}")
-            return search_id
-        else:
-            if resp.status_code == 422:
-                # Print details for troubleshooting; remove or comment out in production
-                try:
-                    print("    422 response details:", resp.json())
-                except Exception:
-                    print("    422 response (non-JSON):", resp.text)
-            else:
-                print(f"    AQL start error: {resp.status_code} - {resp.text}")
-    except Exception as e:
-        print(f"⚠️ Exception starting AQL search: {e}")
-    return None
-
-
-def _get_search_results(qradar_host, username, password, search_id, poll_interval=2, max_polls=15):
-    """
-    Poll for Ariel search results. Returns the JSON dict when 'events' found or empty dict.
-    Include SEC header if provided.
-    """
-    endpoint = f"{qradar_host.rstrip('/')}/api/ariel/searches/{search_id}/results"
-    headers = _build_auth_headers()
-    auth = (username, password) if username and password else None
-    for attempt in range(max_polls):
-        time.sleep(poll_interval)
-        try:
-            resp = requests.get(
-                endpoint,
-                auth=auth,
-                verify=VERIFY_SSL,
-                timeout=30,
-                headers=headers
-            )
-            print(f"  → GET {endpoint} returned {resp.status_code}")
-            if resp.status_code == 200:
-                data = resp.json()
-                if 'events' in data:
-                    return data
-            else:
-                print(f"⚠️ Polling AQL search {search_id}, status {resp.status_code}: {resp.text}")
-        except Exception as e:
-            print(f"⚠️ Exception polling AQL search: {e}")
-    print(f"⚠️ AQL search {search_id} did not return events after polling.")
-    return {}
-
-
 def get_log_source_details(qradar_host, username, password, identifier, is_ip=False):
     """
     Lookup a log source by name or IP and return its details,
-    including the actual last event timestamp, days since last event,
-    and a flag if inactive beyond threshold.
+    including the last_event_time from config API, days since last event,
+    and a flag if inactive beyond threshold. No AQL used.
     Uses GET /api/config/event_sources/log_source_management/log_sources?filter=... .
-    Include SEC header if provided.
+    Expects the API to return 'last_event_time' in milliseconds since epoch. 2
     """
     filter_key = 'ip_address' if is_ip else 'name'
-    # Construct exactly one filter parameter
     query_filter = f'{filter_key}="{identifier}"'
     ls_endpoint = f"{qradar_host.rstrip('/')}/api/config/event_sources/log_source_management/log_sources"
 
     try:
-        headers = _build_auth_headers()
-        auth = (username, password) if username and password else None
+        # Correct: exactly one 'filter' parameter
         resp = requests.get(
             ls_endpoint,
             params={'filter': query_filter},
-            auth=auth,
+            auth=(username, password),
             verify=VERIFY_SSL,
             timeout=30,
-            headers=headers
+            headers={'Accept': 'application/json'}
         )
-        # Print for debugging; in production you may reduce verbosity
+        # Print for debugging; you can reduce verbosity if desired
         print(f"  → GET {ls_endpoint}?filter={query_filter} returned {resp.status_code}")
         if resp.status_code != 200:
             if resp.status_code == 422:
@@ -216,55 +120,42 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
         if ls_id is None:
             return {'status': 'No ID in response', **_empty_details()}
 
-        # Build AQL to get the MAX(starttime) for last INACTIVITY_THRESHOLD_DAYS days
-        aql = f"SELECT MAX(starttime) AS max_starttime FROM events WHERE logsourceid={ls_id} LAST {INACTIVITY_THRESHOLD_DAYS} DAYS"
-        print(f"    AQL: {aql}")
-        search_id = _start_aql_search(qradar_host, username, password, aql)
-
-        last_seen = ''
-        activity_status = 'No Activity'
-        days_since_last_event = None
-        might_be_disabled = 'Yes'
-
-        if search_id:
-            results = _get_search_results(qradar_host, username, password, search_id)
-            events = results.get('events', [])
-            if events and events[0].get('max_starttime') is not None:
-                epoch_ms = events[0]['max_starttime']
-                try:
-                    last_dt = datetime.fromtimestamp(epoch_ms / 1000)
-                    last_seen = last_dt.strftime('%Y-%m-%d %H:%M:%S')
-                    delta = datetime.now() - last_dt
-                    days_since_last_event = delta.days
-                    if delta <= timedelta(days=INACTIVITY_THRESHOLD_DAYS):
-                        activity_status = 'Active'
-                        might_be_disabled = 'No'
-                    else:
-                        activity_status = 'Inactive'
-                        might_be_disabled = 'Yes'
-                except Exception as e:
-                    print(f"      ⚠️ Error parsing timestamp: {e}")
-                    last_seen = 'Error parsing timestamp'
-                    activity_status = 'Unknown'
-                    might_be_disabled = 'Unknown'
-            else:
-                # No events in threshold window
-                last_seen = f'No events in last {INACTIVITY_THRESHOLD_DAYS} days'
-                activity_status = 'Inactive'
-                days_since_last_event = None
-                might_be_disabled = 'Yes'
-        else:
-            # AQL could not start or timed out
-            last_seen = 'AQL Error/Timeout'
+        # Extract last_event_time if present (milliseconds since epoch)
+        last_event_ms = log_source.get('last_event_time')
+        if last_event_ms is None:
+            # If the field is missing or null, treat as no events seen or unknown
+            last_seen = f'No last_event_time field'
             activity_status = 'Unknown'
             days_since_last_event = None
             might_be_disabled = 'Unknown'
+        else:
+            try:
+                last_dt = datetime.fromtimestamp(last_event_ms / 1000.0)
+                last_seen = last_dt.strftime('%Y-%m-%d %H:%M:%S')
+                delta = datetime.now() - last_dt
+                days_since_last_event = delta.days
+                if delta.days <= INACTIVITY_THRESHOLD_DAYS:
+                    activity_status = 'Active'
+                    might_be_disabled = 'No'
+                else:
+                    activity_status = 'Inactive'
+                    might_be_disabled = 'Yes'
+            except Exception as e:
+                print(f"    ⚠️ Error parsing last_event_time: {e}")
+                last_seen = 'Error parsing last_event_time'
+                activity_status = 'Unknown'
+                days_since_last_event = None
+                might_be_disabled = 'Unknown'
+
+        # You can also read additional fields if needed, e.g., protocol_type, enabled, etc.
+        protocol_type = log_source.get('protocol_type', '')
+        enabled = log_source.get('enabled', '')
 
         return {
             'status': 'Found',
             'qradar_id': ls_id,
-            'protocol_type': log_source.get('protocol_type', ''),
-            'enabled': log_source.get('enabled', ''),
+            'protocol_type': protocol_type,
+            'enabled': enabled,
             'last_seen': last_seen,
             'activity_status': activity_status,
             'days_since_last_event': days_since_last_event,
@@ -337,7 +228,7 @@ def main():
     if not VERIFY_SSL:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-    print("🚀 Starting QRadar Log Source Checker with SEC token support, last-event timestamp and inactivity flag...")
+    print("🚀 Starting QRadar Log Source Checker using last_event_time (no AQL)...")
 
     # Test connection
     if not test_qradar_connection(QRADAR_HOST, QRADAR_USERNAME, QRADAR_PASSWORD):
