@@ -37,7 +37,6 @@ def test_qradar_connection(qradar_host, username, password):
     print("🔗 Testing QRadar connection...")
     qradar_host = qradar_host.rstrip('/')
     test_endpoint = f"{qradar_host}/api/help/versions"
-
     try:
         resp = requests.get(
             test_endpoint,
@@ -46,6 +45,7 @@ def test_qradar_connection(qradar_host, username, password):
             timeout=10,
             headers={'Accept': 'application/json'}
         )
+        print(f"  → GET {test_endpoint} returned {resp.status_code}")
         if resp.status_code == 200:
             print("✅ QRadar connection successful!")
             return True
@@ -53,7 +53,7 @@ def test_qradar_connection(qradar_host, username, password):
             print("❌ Authentication failed! Check username/password.")
             return False
         else:
-            print(f"⚠️ Unexpected response: {resp.status_code}")
+            print(f"⚠️ Unexpected response: {resp.status_code} - {resp.text}")
             return False
     except Exception as e:
         print(f"❌ Connection failed: {e}")
@@ -69,28 +69,41 @@ def _empty_details():
         'last_seen': '',
         'activity_status': '',
         'days_since_last_event': None,
-        'might_be_disabled_alert': ''  # Yes/No
+        'might_be_disabled_alert': ''  # 'Yes' / 'No' / 'Unknown'
     }
 
 
 def _start_aql_search(qradar_host, username, password, query):
     """
     Start an Ariel (AQL) search. Returns search_id or None.
+    Uses POST /api/ariel/searches with JSON {"query_expression": "<AQL>"} 4.
     """
     endpoint = f"{qradar_host.rstrip('/')}/api/ariel/searches"
+    payload = {'query_expression': query}
     try:
+        print(f"  → POST {endpoint}")
+        print(f"    JSON payload: {payload}")
         resp = requests.post(
             endpoint,
             auth=(username, password),
             verify=VERIFY_SSL,
             timeout=30,
             headers={'Accept': 'application/json', 'Content-Type': 'application/json'},
-            json={'query_expression': query}
+            json=payload
         )
+        print(f"    Response: {resp.status_code} - {resp.text[:200]}")
         if resp.status_code == 201:
-            return resp.json().get('search_id')
+            sid = resp.json().get('search_id')
+            print(f"    Started AQL search, search_id={sid}")
+            return sid
         else:
-            print(f"⚠️ AQL search start returned status {resp.status_code}: {resp.text}")
+            # If 422 or other, print full JSON if possible
+            if resp.status_code == 422:
+                try:
+                    print("    422 details:", resp.json())
+                except Exception:
+                    print("    422 non-JSON response:", resp.text)
+            return None
     except Exception as e:
         print(f"⚠️ Exception starting AQL search: {e}")
     return None
@@ -104,6 +117,7 @@ def _get_search_results(qradar_host, username, password, search_id, poll_interva
     for attempt in range(max_polls):
         time.sleep(poll_interval)
         try:
+            print(f"    Polling AQL search_id={search_id}, attempt {attempt+1}/{max_polls}")
             resp = requests.get(
                 endpoint,
                 auth=(username, password),
@@ -111,14 +125,15 @@ def _get_search_results(qradar_host, username, password, search_id, poll_interva
                 timeout=30,
                 headers={'Accept': 'application/json'}
             )
+            print(f"      GET {endpoint} returned {resp.status_code}")
             if resp.status_code == 200:
                 data = resp.json()
-                # If search still running, QRadar may return status but no 'events' yet.
                 if 'events' in data:
+                    print(f"      Received events in response.")
                     return data
-                # Else keep polling
+                # else keep polling
             else:
-                print(f"⚠️ Polling AQL search {search_id}, status {resp.status_code}")
+                print(f"⚠️ Polling AQL search {search_id}, status {resp.status_code}: {resp.text}")
         except Exception as e:
             print(f"⚠️ Exception polling AQL search: {e}")
     print(f"⚠️ AQL search {search_id} did not return events after polling.")
@@ -130,41 +145,53 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
     Lookup a log source by name or IP and return its details,
     including the actual last event timestamp, days since last event,
     and a flag if inactive beyond threshold.
+    Uses GET /api/config/event_sources/log_source_management/log_sources?filter=... 5.
     """
     filter_key = 'ip_address' if is_ip else 'name'
     query_filter = f'{filter_key}="{identifier}"'
     ls_endpoint = f"{qradar_host.rstrip('/')}/api/config/event_sources/log_source_management/log_sources"
-
     try:
+        # Correct usage: exactly one 'filter' parameter
+        params = {'filter': query_filter}
+        print(f"  → GET {ls_endpoint} with params={params}")
         resp = requests.get(
             ls_endpoint,
-            params={'filter': query_filter},
+            params=params,
             auth=(username, password),
             verify=VERIFY_SSL,
             timeout=30,
             headers={'Accept': 'application/json'}
         )
+        print(f"    Response: {resp.status_code} - {resp.text[:200]}")
         if resp.status_code != 200:
+            # If 422, print debug
+            if resp.status_code == 422:
+                try:
+                    print("    422 error details:", resp.json())
+                except Exception:
+                    print("    422 non-JSON response:", resp.text)
             return {'status': f'API Error {resp.status_code}', **_empty_details()}
 
         ls_data = resp.json()
-        if not ls_data:
+        if not isinstance(ls_data, list) or not ls_data:
             return {'status': 'Not Found', **_empty_details()}
 
         # Assume first match is desired
         log_source = ls_data[0]
         ls_id = log_source.get('id')
+        if ls_id is None:
+            return {'status': 'No ID in response', **_empty_details()}
 
-        # Build AQL to get the MAX(starttime) for last N days (we choose threshold days, but we query a bit larger window if desired).
-        # Here we query LAST INACTIVITY_THRESHOLD_DAYS days; if no events, we return “No events in last N days.”
-        # You may choose to query a longer window or entire history; but large windows may be slow.
+        # Build AQL to get the MAX(starttime) for last N days
+        # We query LAST INACTIVITY_THRESHOLD_DAYS DAYS to check for recent events.
         aql = f"SELECT MAX(starttime) AS max_starttime FROM events WHERE logsourceid={ls_id} LAST {INACTIVITY_THRESHOLD_DAYS} DAYS"
+        print(f"    Constructed AQL: {aql}")
         search_id = _start_aql_search(qradar_host, username, password, aql)
 
         last_seen = ''
         activity_status = 'No Activity'
         days_since_last_event = None
-        might_be_disabled = 'Yes'  # default if no recent events
+        might_be_disabled = 'Yes'  # default if no events or error
 
         if search_id:
             results = _get_search_results(qradar_host, username, password, search_id)
@@ -172,26 +199,30 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
             if events and events[0].get('max_starttime') is not None:
                 epoch_ms = events[0]['max_starttime']
                 # Convert epoch (ms) to datetime
-                last_dt = datetime.fromtimestamp(epoch_ms / 1000)
-                last_seen = last_dt.strftime('%Y-%m-%d %H:%M:%S')
-                # Calculate days since:
-                delta = datetime.now() - last_dt
-                days_since_last_event = delta.days
-                # Active if within threshold
-                if delta <= timedelta(days=INACTIVITY_THRESHOLD_DAYS):
-                    activity_status = 'Active'
-                    might_be_disabled = 'No'
-                else:
-                    activity_status = 'Inactive'
-                    might_be_disabled = 'Yes'
+                try:
+                    last_dt = datetime.fromtimestamp(epoch_ms / 1000)
+                    last_seen = last_dt.strftime('%Y-%m-%d %H:%M:%S')
+                    delta = datetime.now() - last_dt
+                    days_since_last_event = delta.days
+                    if delta <= timedelta(days=INACTIVITY_THRESHOLD_DAYS):
+                        activity_status = 'Active'
+                        might_be_disabled = 'No'
+                    else:
+                        activity_status = 'Inactive'
+                        might_be_disabled = 'Yes'
+                except Exception as e:
+                    print(f"      ⚠️ Error parsing epoch_ms: {e}")
+                    last_seen = f"Error parsing timestamp"
+                    activity_status = 'Unknown'
+                    might_be_disabled = 'Unknown'
             else:
-                # No events returned in last threshold days
+                # No events in window
                 last_seen = f'No events in last {INACTIVITY_THRESHOLD_DAYS} days'
                 activity_status = 'Inactive'
                 days_since_last_event = None
                 might_be_disabled = 'Yes'
         else:
-            # Could not start/search AQL
+            # Could not start AQL search
             last_seen = 'AQL Error/Timeout'
             activity_status = 'Unknown'
             days_since_last_event = None
@@ -209,62 +240,8 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
         }
 
     except Exception as e:
+        print(f"  ⚠️ Exception in get_log_source_details for identifier={identifier}: {e}")
         return {'status': f'Error: {e}', **_empty_details()}
-
-
-def get_qradar_health_metrics(qradar_host, username, password):
-    """
-    Example: Fetch QRadar system health metric definitions and current values.
-    You may refine which metrics to retrieve (e.g., CPU, Memory, Disk, etc.)
-    """
-    base = qradar_host.rstrip('/')
-    # 1) List all system metrics
-    sys_metrics_endpoint = f"{base}/api/health/metrics/system_metrics"
-    try:
-        resp = requests.get(
-            sys_metrics_endpoint,
-            auth=(username, password),
-            verify=VERIFY_SSL,
-            timeout=30,
-            headers={'Accept': 'application/json'}
-        )
-        if resp.status_code != 200:
-            print(f"⚠️ Unable to list system metrics: {resp.status_code}")
-            return {}
-        # Sample response: list of metric definitions, each with 'id', 'name', 'description', etc.
-        metrics_list = resp.json()
-    except Exception as e:
-        print(f"⚠️ Exception fetching system_metrics list: {e}")
-        return {}
-
-    # 2) For demo: fetch first N metrics or filter by name keyword (e.g., 'CPU' or 'Memory')
-    #    In practice, pick the IDs you need.
-    results = {}
-    for metric in metrics_list:
-        metric_id = metric.get('id')
-        metric_name = metric.get('name')
-        # Example filter: only CPU or Memory metrics (adjust as needed)
-        if metric_name and any(keyword in metric_name.lower() for keyword in ['cpu', 'memory', 'disk', 'uptime']):
-            try:
-                m_resp = requests.get(
-                    f"{sys_metrics_endpoint}/{metric_id}",
-                    auth=(username, password),
-                    verify=VERIFY_SSL,
-                    timeout=30,
-                    headers={'Accept': 'application/json'}
-                )
-                if m_resp.status_code == 200:
-                    # The returned JSON may include current value(s), timestamp, etc.
-                    results[metric_name] = m_resp.json()
-                else:
-                    print(f"⚠️ Failed to fetch metric {metric_id}: {m_resp.status_code}")
-            except Exception as e:
-                print(f"⚠️ Exception fetching metric {metric_id}: {e}")
-        # Optionally break after some metrics if too many
-        # if len(results) >= 5:
-        #     break
-
-    return results
 
 
 def process_sheet(df, sheet_name, qradar_host, username, password, logsource_column, ip_column):
@@ -295,14 +272,14 @@ def process_sheet(df, sheet_name, qradar_host, username, password, logsource_col
             print(f"[{idx+1}/{total}] Lookup by name: {name_val}")
             details = get_log_source_details(qradar_host, username, password, name_val, is_ip=False)
 
-        # If not found or error, fallback to IP
+        # If not found or status indicates Not Found, fallback to IP
         if not details or details.get('status') == 'Not Found':
             ip_val = str(row[ip_column]).strip() if ip_column in df.columns else ''
             if ip_val and ip_val.lower() not in ['nan', 'none', '']:
                 print(f"   🔁 Name not found; fallback to IP: {ip_val}")
                 details = get_log_source_details(qradar_host, username, password, ip_val, is_ip=True)
 
-        # If still no details
+        # If still no details, mark empty/invalid
         if not details:
             details = {
                 'status': 'Empty/Invalid',
@@ -321,7 +298,8 @@ def process_sheet(df, sheet_name, qradar_host, username, password, logsource_col
 
         print(f"   → {details.get('status')} | Last Seen: {details.get('last_seen')} | MightBeDisabled: {details.get('might_be_disabled_alert')}")
 
-        time.sleep(0.5)  # Rate-limit
+        # Rate-limit: adjust as needed
+        time.sleep(0.5)
 
     return df
 
@@ -331,22 +309,12 @@ def main():
     if not VERIFY_SSL:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-    print("🚀 Starting QRadar Log Source Checker with IP fallback, last-event timestamp, inactivity flag, and health metrics...")
+    print("🚀 Starting QRadar Log Source Checker with last-event timestamp and inactivity flag...")
 
     # Test connection
     if not test_qradar_connection(QRADAR_HOST, QRADAR_USERNAME, QRADAR_PASSWORD):
         print("❌ Cannot connect to QRadar. Exiting.")
         return
-
-    # Optionally: fetch and print some health metrics
-    print("\n🔍 Fetching sample QRadar health metrics (CPU/Memory/etc)...")
-    health_metrics = get_qradar_health_metrics(QRADAR_HOST, QRADAR_USERNAME, QRADAR_PASSWORD)
-    if health_metrics:
-        for name, data in health_metrics.items():
-            # The structure depends on QRadar version; print or log key parts
-            print(f"Metric: {name} -> {data}")
-    else:
-        print("⚠️ No health metrics retrieved or no matching filters.")
 
     # Load Excel
     print(f"\n📖 Reading Excel file: {INPUT_EXCEL_PATH}")
@@ -391,11 +359,11 @@ def main():
         df = all_sheets.get(sheet)
         if df is not None and 'status' in df.columns:
             print(f"\n📊 Summary for {sheet}:")
-            print("Status counts:", df['status'].value_counts().to_dict())
+            print("  Status counts:", df['status'].value_counts().to_dict())
             if 'activity_status' in df.columns:
-                print("Activity status counts:", df['activity_status'].value_counts().to_dict())
+                print("  Activity status counts:", df['activity_status'].value_counts().to_dict())
             if 'might_be_disabled_alert' in df.columns:
-                print("Might-be-disabled flag counts:", df['might_be_disabled_alert'].value_counts().to_dict())
+                print("  Might-be-disabled flag counts:", df['might_be_disabled_alert'].value_counts().to_dict())
 
 
 if __name__ == '__main__':
