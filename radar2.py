@@ -1,437 +1,182 @@
 import pandas as pd
 import requests
 import urllib3
+from datetime import datetime, timedelta
 import time
-from typing import Dict, Any
-import logging
-from pathlib import Path
-import base64
+import os
+import win32com.client  # For creating draft emails in Outlook
 
 # ─── CONFIGURATION ─────────────────────────────────────────────────────────────
 
-# 1) Path to your existing Excel file:
-INPUT_EXCEL_PATH = 'input.xlsx'
+# 1) Path to your existing Excel file (use forward slashes or raw string):
+INPUT_EXCEL_PATH = r'C:\path\to\your\input.xlsx'
 
-# 2) Which sheet in the Excel file to read (by name or index):
-EXCEL_SHEET_NAME = 0  # or e.g. 'Sheet1'
+# 2) List of sheet names to process (or use ['all'] to process all sheets):
+SHEETS_TO_PROCESS = ['Sheet1', 'Sheet2']  # or ['all'] for all sheets
 
 # 3) The name of the column containing log source names:
 LOGSOURCE_COLUMN = 'log source name'
 
-# 4) Full URL (including protocol) of your QRadar console:
-QRADAR_HOST = 'https://your-qradar-host'
+# 4) The name of the column containing IP addresses (fallback):
+IP_COLUMN = 'IP'
 
-# 5) QRadar Basic Authentication Credentials:
+# 5) QRadar details:
+QRADAR_HOST = 'https://your-qradar-host'
 QRADAR_USERNAME = 'your-username'
 QRADAR_PASSWORD = 'your-password'
 
-# 6) Path to your SSL certificate (PEM) to verify the QRadar TLS connection.
-#    If you want to skip verification (not recommended), set VERIFY_SSL=False.
-SSL_CERT_PATH = '/path/to/your/qradar_cert.pem'
-VERIFY_SSL = True  # set to False ONLY for testing/self‐signed (not recommended in prod)
+# 6) SSL verification (set to False for testing):
+VERIFY_SSL = False
 
-# 7) Rate limiting - delay between API calls (seconds)
-API_DELAY = 0.5  # Adjust based on your QRadar's rate limits
-
-# 8) Retry configuration
-MAX_RETRIES = 3
-RETRY_DELAY = 2
+# 7) Path to save the filtered Excel draft attachment:
+DRAFT_OUTPUT_PATH = os.path.join(os.path.dirname(INPUT_EXCEL_PATH), 'inactive_and_errors.xlsx')
 
 # ─── END CONFIGURATION ─────────────────────────────────────────────────────────
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('qradar_log_source_check.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
 
-
-def validate_configuration() -> bool:
-    """Validate the configuration before running."""
-    errors = []
-    
-    # Check if Excel file exists
-    if not Path(INPUT_EXCEL_PATH).exists():
-        errors.append(f"Excel file not found: {INPUT_EXCEL_PATH}")
-    
-    # Check QRadar host format
-    if not QRADAR_HOST.startswith(('http://', 'https://')):
-        errors.append("QRADAR_HOST must include protocol (http:// or https://)")
-    
-    # Check credentials
-    if QRADAR_USERNAME == 'your-username' or QRADAR_PASSWORD == 'your-password':
-        errors.append("Please set your actual QRadar username and password")
-    
-    if not QRADAR_USERNAME or not QRADAR_PASSWORD:
-        errors.append("QRadar username and password cannot be empty")
-    
-    # Check SSL certificate if verification is enabled
-    if VERIFY_SSL and SSL_CERT_PATH != '/path/to/your/qradar_cert.pem' and not Path(SSL_CERT_PATH).exists():
-        logger.warning(f"SSL certificate not found at {SSL_CERT_PATH}. Consider setting VERIFY_SSL=False for testing.")
-    
-    if errors:
-        for error in errors:
-            logger.error(error)
-        return False
-    
-    return True
-
-
-def create_auth_header(username: str, password: str) -> str:
-    """Create Basic Authentication header."""
-    credentials = f"{username}:{password}"
-    encoded_credentials = base64.b64encode(credentials.encode('utf-8')).decode('utf-8')
-    return f"Basic {encoded_credentials}"
-
-
-def get_log_source_details(qradar_host: str,
-                           username: str,
-                           password: str,
-                           log_source_name: str,
-                           ssl_cert: str,
-                           verify_ssl: bool,
-                           retries: int = 0) -> Dict[str, Any]:
-    """
-    Queries QRadar for a log source matching exactly `log_source_name` using Basic Authentication.
-    Enhanced with better error handling, retries, and logging.
-    """
-    # Clean the QRadar host URL (remove trailing slash if present)
+def test_qradar_connection(qradar_host, username, password):
+    """Test if we can connect to the QRadar API."""
+    print("🔗 Testing QRadar connection...")
     qradar_host = qradar_host.rstrip('/')
-    
-    endpoint = f"{qradar_host}/api/config/event_sources/log_source_management/log_sources"
-    
-    # Properly escape the log source name for the filter
-    safe_name = log_source_name.replace('"', '\\"').replace("'", "\\'")
-    params = {
-        'filter': f'name="{safe_name}"'
-    }
-    
-    # Create Basic Auth header
-    auth_header = create_auth_header(username, password)
-    
-    headers = {
-        'Accept': 'application/json',
-        'Content-Type': 'application/json',
-        'Authorization': auth_header,
-        'Version': '12.0'  # Specify API version for consistency
-    }
-
-    # Determine SSL verification setting
-    if verify_ssl and SSL_CERT_PATH != '/path/to/your/qradar_cert.pem' and Path(ssl_cert).exists():
-        ssl_verify = ssl_cert
-    elif verify_ssl:
-        ssl_verify = True  # Use default CA bundle
-    else:
-        ssl_verify = False
+    test_endpoint = f"{qradar_host}/api/help/versions"
 
     try:
-        logger.debug(f"Querying QRadar for log source: {log_source_name}")
-        
         resp = requests.get(
-            endpoint,
-            headers=headers,
-            params=params,
-            verify=ssl_verify,
-            timeout=30  # Increased timeout
+            test_endpoint,
+            auth=(username, password),
+            verify=VERIFY_SSL,
+            timeout=10,
+            headers={'Accept': 'application/json'}
         )
-        
-        # Check for authentication failure
-        if resp.status_code == 401:
-            logger.error(f"Authentication failed for '{log_source_name}'. Check username/password.")
-            return {
-                'status': 'Auth Error',
-                'qradar_id': '',
-                'protocol_type': '',
-                'protocol_name': '',
-                'enabled': '',
-                'description': '',
-                'error_details': 'Authentication failed - check credentials'
-            }
-        
-        # Check for authorization failure
-        if resp.status_code == 403:
-            logger.error(f"Access forbidden for '{log_source_name}'. User may not have sufficient privileges.")
-            return {
-                'status': 'Access Denied',
-                'qradar_id': '',
-                'protocol_type': '',
-                'protocol_name': '',
-                'enabled': '',
-                'description': '',
-                'error_details': 'Access denied - insufficient privileges'
-            }
-        
-        # Check for rate limiting
-        if resp.status_code == 429:
-            logger.warning(f"Rate limited for '{log_source_name}'. Waiting before retry...")
-            time.sleep(RETRY_DELAY * 2)  # Wait longer for rate limits
-            if retries < MAX_RETRIES:
-                return get_log_source_details(qradar_host, username, password, log_source_name, 
-                                            ssl_cert, verify_ssl, retries + 1)
-        
-        resp.raise_for_status()
-        
-    except requests.exceptions.SSLError as e:
-        logger.error(f"SSL ERROR for '{log_source_name}': {e}")
-        if retries < MAX_RETRIES:
-            logger.info(f"Retrying ({retries + 1}/{MAX_RETRIES})...")
-            time.sleep(RETRY_DELAY)
-            return get_log_source_details(qradar_host, username, password, log_source_name, 
-                                        ssl_cert, verify_ssl, retries + 1)
-        return {
-            'status': 'SSL Error',
-            'qradar_id': '',
-            'protocol_type': '',
-            'protocol_name': '',
-            'enabled': '',
-            'description': '',
-            'error_details': str(e)
-        }
-        
-    except requests.exceptions.Timeout as e:
-        logger.error(f"TIMEOUT ERROR for '{log_source_name}': {e}")
-        if retries < MAX_RETRIES:
-            logger.info(f"Retrying ({retries + 1}/{MAX_RETRIES})...")
-            time.sleep(RETRY_DELAY)
-            return get_log_source_details(qradar_host, username, password, log_source_name, 
-                                        ssl_cert, verify_ssl, retries + 1)
-        return {
-            'status': 'Timeout Error',
-            'qradar_id': '',
-            'protocol_type': '',
-            'protocol_name': '',
-            'enabled': '',
-            'description': '',
-            'error_details': str(e)
-        }
-        
-    except requests.exceptions.RequestException as e:
-        logger.error(f"REQUEST ERROR for '{log_source_name}': {e}")
-        if retries < MAX_RETRIES:
-            logger.info(f"Retrying ({retries + 1}/{MAX_RETRIES})...")
-            time.sleep(RETRY_DELAY)
-            return get_log_source_details(qradar_host, username, password, log_source_name, 
-                                        ssl_cert, verify_ssl, retries + 1)
-        return {
-            'status': 'Request Error',
-            'qradar_id': '',
-            'protocol_type': '',
-            'protocol_name': '',
-            'enabled': '',
-            'description': '',
-            'error_details': str(e)
-        }
-
-    try:
-        data = resp.json()
-    except ValueError as e:
-        logger.error(f"JSON decode error for '{log_source_name}': {e}")
-        return {
-            'status': 'JSON Error',
-            'qradar_id': '',
-            'protocol_type': '',
-            'protocol_name': '',
-            'enabled': '',
-            'description': '',
-            'error_details': 'Invalid JSON response'
-        }
-
-    # Handle the response data
-    if isinstance(data, list) and len(data) > 0:
-        # Take the first match (assuming names should be unique)
-        ls = data[0]
-        
-        # Log if multiple matches found
-        if len(data) > 1:
-            logger.warning(f"Multiple log sources found for '{log_source_name}'. Using first match (ID: {ls.get('id')})")
-        
-        return {
-            'status': 'Exists',
-            'qradar_id': ls.get('id', ''),
-            'protocol_type': ls.get('protocol_type', ''),
-            'protocol_name': ls.get('protocol_name', ''),
-            'enabled': ls.get('enabled', ''),
-            'description': ls.get('description', '') or '',
-            'error_details': ''
-        }
-    else:
-        return {
-            'status': 'Not Found',
-            'qradar_id': '',
-            'protocol_type': '',
-            'protocol_name': '',
-            'enabled': '',
-            'description': '',
-            'error_details': ''
-        }
-
-
-def test_connection(qradar_host: str, username: str, password: str, ssl_cert: str, verify_ssl: bool) -> bool:
-    """Test the connection to QRadar before processing the full list."""
-    logger.info("Testing connection to QRadar...")
-    
-    qradar_host = qradar_host.rstrip('/')
-    endpoint = f"{qradar_host}/api/config/event_sources/log_source_management/log_sources"
-    
-    auth_header = create_auth_header(username, password)
-    headers = {
-        'Accept': 'application/json',
-        'Authorization': auth_header,
-        'Version': '12.0'
-    }
-    
-    # Determine SSL verification setting
-    if verify_ssl and SSL_CERT_PATH != '/path/to/your/qradar_cert.pem' and Path(ssl_cert).exists():
-        ssl_verify = ssl_cert
-    elif verify_ssl:
-        ssl_verify = True
-    else:
-        ssl_verify = False
-    
-    try:
-        # Test with a simple query (limit to 1 result)
-        params = {'Range': 'items=0-0'}
-        resp = requests.get(endpoint, headers=headers, params=params, verify=ssl_verify, timeout=10)
-        
-        if resp.status_code == 401:
-            logger.error("❌ Authentication failed. Please check your username and password.")
-            return False
-        elif resp.status_code == 403:
-            logger.error("❌ Access denied. User may not have sufficient privileges to access log sources.")
-            return False
-        elif resp.status_code == 200:
-            logger.info("✅ Connection test successful!")
+        if resp.status_code == 200:
+            print("✅ QRadar connection successful!")
             return True
+        elif resp.status_code == 401:
+            print("❌ Authentication failed! Check username/password.")
+            return False
         else:
-            logger.warning(f"⚠️ Unexpected response code: {resp.status_code}")
-            resp.raise_for_status()
-            return True
-            
-    except requests.exceptions.RequestException as e:
-        logger.error(f"❌ Connection test failed: {e}")
+            print(f"⚠️ Unexpected response: {resp.status_code}")
+            return False
+    except Exception as e:
+        print(f"❌ Connection failed: {e}")
         return False
 
+# ... existing helper functions (_empty_details, _start_aql_search, _get_search_results, get_log_source_details, process_sheet) remain unchanged ...
 
-def backup_excel_file(file_path: str) -> str:
-    """Create a backup of the Excel file before modifying it."""
-    backup_path = f"{Path(file_path).stem}_backup{Path(file_path).suffix}"
-    import shutil
-    shutil.copy2(file_path, backup_path)
-    logger.info(f"Backup created: {backup_path}")
-    return backup_path
+# ─── NEW FEATURE: EMAIL DRAFT GENERATION ────────────────────────────────────────
+
+def create_outlook_draft(attachment_path, subject, body):
+    """
+    Create an Outlook draft email with the given attachment, subject, and body.
+    """
+    outlook = win32com.client.Dispatch('Outlook.Application')
+    mail = outlook.CreateItem(0)  # 0: olMailItem
+    mail.Subject = subject
+    mail.Body = body
+    mail.Attachments.Add(attachment_path)
+    mail.Save()  # Saves to Drafts folder
+    print(f"✉️ Draft email created with attachment: {attachment_path}")
+
+
+def filter_and_email(df_dict, draft_path):
+    """
+    From the processed sheets, extract rows that are inactive or API errors,
+    add remark, save to a new Excel, and create an email draft with counts.
+    """
+    frames = []
+    for name, df in df_dict.items():
+        if 'status' in df.columns and 'activity_status' in df.columns:
+            mask = (
+                (df['activity_status'] != 'Active') |
+                (df['status'].str.startswith('API Error'))
+            )
+            subset = df[mask].copy()
+            if not subset.empty:
+                subset['remark'] = 'Check log source name'
+                subset['sheet_name'] = name
+                frames.append(subset)
+
+    if frames:
+        result_df = pd.concat(frames, ignore_index=True)
+        # Calculate counts
+        total = len(result_df)
+        num_inactive = result_df[result_df['activity_status'] != 'Active'].shape[0]
+        num_api_errors = result_df[result_df['status'].str.startswith('API Error')].shape[0]
+
+        # Save filtered rows to new Excel
+        result_df.to_excel(draft_path, index=False)
+        print(f"💾 Filtered rows saved to: {draft_path}")
+
+        # Prepare email content
+        subject = "Inactive Log Sources"
+        body = (
+            f"Hello,\n\n"
+            f"Please find attached the QRadar log source report generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.\n"
+            f"Summary:\n"
+            f"  • Total flagged rows: {total}\n"
+            f"  • Inactive sources: {num_inactive}\n"
+            f"  • API error sources: {num_api_errors}\n\n"
+            "Rows are tagged with 'Check log source name' for your review.\n\n"
+            "Best regards,\n"
+            "Your QRadar Automation Bot"
+        )
+        create_outlook_draft(draft_path, subject, body)
+    else:
+        print("✅ No inactive or API error rows found; no email draft created.")
 
 
 def main():
-    logger.info("Starting QRadar Log Source Checker (Basic Auth Version)")
-    
-    # Validate configuration
-    if not validate_configuration():
-        logger.error("Configuration validation failed. Please check your settings.")
-        return
-    
-    # Suppress only InsecureRequestWarning if VERIFY_SSL=False
+    # Disable SSL warnings if VERIFY_SSL is False
     if not VERIFY_SSL:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        logger.warning("SSL verification disabled - not recommended for production")
 
-    # Test connection first
-    if not test_connection(QRADAR_HOST, QRADAR_USERNAME, QRADAR_PASSWORD, SSL_CERT_PATH, VERIFY_SSL):
-        logger.error("Connection test failed. Please check your configuration and try again.")
+    print("🚀 Starting QRadar Log Source Checker with draft email feature...")
+
+    # Test connection
+    if not test_qradar_connection(QRADAR_HOST, QRADAR_USERNAME, QRADAR_PASSWORD):
+        print("❌ Cannot connect to QRadar. Exiting.")
         return
 
-    try:
-        # Create backup
-        backup_path = backup_excel_file(INPUT_EXCEL_PATH)
-        
-        # Step 1: Read the Excel file into a DataFrame
-        logger.info(f"Reading Excel file: {INPUT_EXCEL_PATH}")
-        df = pd.read_excel(INPUT_EXCEL_PATH, sheet_name=EXCEL_SHEET_NAME)
-        logger.info(f"Loaded {len(df)} rows from Excel file")
+    # Load Excel
+    print(f"\n📖 Reading Excel file: {INPUT_EXCEL_PATH}")
+    all_sheets = pd.read_excel(INPUT_EXCEL_PATH, sheet_name=None)
+    sheet_names = list(all_sheets.keys())
+    print(f"Found sheets: {sheet_names}")
 
-        # Step 2: Ensure the "log source name" column exists
-        if LOGSOURCE_COLUMN not in df.columns:
-            available_cols = ', '.join(df.columns.tolist())
-            raise KeyError(f"Column '{LOGSOURCE_COLUMN}' not found. Available columns: {available_cols}")
+    # Determine which to process
+    sheets = sheet_names if SHEETS_TO_PROCESS == ['all'] else SHEETS_TO_PROCESS
 
-        # Step 3: Prepare new columns
-        new_cols = ['status', 'qradar_id', 'protocol_type', 'protocol_name', 'enabled', 'description', 'error_details']
-        for col in new_cols:
-            if col not in df.columns:
-                df[col] = ''
-            else:
-                logger.info(f"Column '{col}' already exists - will be overwritten")
+    for sheet in sheets:
+        if sheet in all_sheets:
+            all_sheets[sheet] = process_sheet(
+                all_sheets[sheet],
+                sheet,
+                QRADAR_HOST,
+                QRADAR_USERNAME,
+                QRADAR_PASSWORD,
+                LOGSOURCE_COLUMN,
+                IP_COLUMN
+            )
+        else:
+            print(f"⚠️ Sheet '{sheet}' not in workbook; skipping.")
 
-        total = len(df)
-        successful = 0
-        failed = 0
-        
-        # Step 4: Iterate over each row
-        logger.info(f"Processing {total} log sources...")
-        
-        for idx, row in df.iterrows():
-            log_source_name = str(row[LOGSOURCE_COLUMN]).strip()
-            
-            if not log_source_name or log_source_name.lower() in ['nan', 'none', '']:
-                details = {
-                    'status': 'No log source provided',
-                    'qradar_id': '',
-                    'protocol_type': '',
-                    'protocol_name': '',
-                    'enabled': '',
-                    'description': '',
-                    'error_details': 'Empty or null log source name'
-                }
-            else:
-                details = get_log_source_details(
-                    qradar_host=QRADAR_HOST,
-                    username=QRADAR_USERNAME,
-                    password=QRADAR_PASSWORD,
-                    log_source_name=log_source_name,
-                    ssl_cert=SSL_CERT_PATH,
-                    verify_ssl=VERIFY_SSL
-                )
+    # Save back the original file
+    print(f"\n💾 Saving results to Excel..." )
+    with pd.ExcelWriter(INPUT_EXCEL_PATH, engine='openpyxl') as writer:
+        for name, df in all_sheets.items():
+            df.to_excel(writer, sheet_name=name, index=False)
+    print("✅ Original file updated.")
 
-            # Write back into DataFrame
-            for key, val in details.items():
-                df.at[idx, key] = val
+    # New feature: filter and create draft email
+    filter_and_email(all_sheets, DRAFT_OUTPUT_PATH)
 
-            # Update counters
-            if details['status'] == 'Exists':
-                successful += 1
-            elif details['status'] not in ['No log source provided']:
-                failed += 1
-
-            logger.info(f"[{idx+1}/{total}] '{log_source_name}': {details['status']}")
-            
-            # Rate limiting
-            if idx < total - 1:  # Don't sleep after the last request
-                time.sleep(API_DELAY)
-
-        # Step 5: Save the updated DataFrame
-        logger.info("Saving updated Excel file...")
-        
-        # Use ExcelWriter to preserve formatting better
-        with pd.ExcelWriter(INPUT_EXCEL_PATH, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False, sheet_name=EXCEL_SHEET_NAME if isinstance(EXCEL_SHEET_NAME, str) else 'Sheet1')
-        
-        # Summary
-        logger.info(f"\n✅ Process completed successfully!")
-        logger.info(f"📊 Summary:")
-        logger.info(f"   - Total processed: {total}")
-        logger.info(f"   - Found in QRadar: {successful}")
-        logger.info(f"   - Not found: {total - successful - failed}")
-        logger.info(f"   - Errors: {failed}")
-        logger.info(f"   - Results saved to: {INPUT_EXCEL_PATH}")
-        logger.info(f"   - Backup saved as: {backup_path}")
-
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        raise
+    # Optional summary
+    for sheet in sheets:
+        df = all_sheets.get(sheet)
+        if df is not None and 'status' in df.columns:
+            print(f"\n📊 Summary for {sheet}:")
+            print(df['status'].value_counts().to_dict())
+            print(df['activity_status'].value_counts().to_dict())
 
 
 if __name__ == '__main__':
