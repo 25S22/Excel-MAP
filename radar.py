@@ -207,22 +207,15 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
         
         print(f"   📋 Found log source: {ls_name} (ID: {ls_id})")
 
-        # Multiple AQL queries for comprehensive activity check
-        queries = [
-            # Query 1: Last event timestamp and count for last 30 days
-            f"SELECT MAX(starttime) as last_event, COUNT(*) as event_count FROM events WHERE logsourceid={ls_id} LAST 30 DAYS",
-            
-            # Query 2: Recent activity check (last 7 days)
-            f"SELECT COUNT(*) as recent_count FROM events WHERE logsourceid={ls_id} LAST {ACTIVITY_THRESHOLD_DAYS} DAYS"
-        ]
+        # Simple AQL query - just get the last event timestamp
+        aql_query = f"SELECT MAX(starttime) FROM events WHERE logsourceid={ls_id} LAST 30 DAYS"
         
         last_seen = ''
         activity_status = 'No Activity'
         event_count_30d = 0
-        recent_event_count = 0
         
-        # Execute first query (last event + 30-day count)
-        search_id = _start_aql_search(qradar_host, username, password, queries[0])
+        # Execute the single AQL query
+        search_id = _start_aql_search(qradar_host, username, password, aql_query)
         if search_id:
             results = _get_search_results(qradar_host, username, password, search_id)
             events = results.get('events', [])
@@ -231,8 +224,8 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
                 event_data = events[0]
                 
                 # Get last event timestamp
-                last_event_ms = event_data.get('last_event')
-                if last_event_ms and last_event_ms != 'NULL':
+                last_event_ms = event_data.get('MAX(starttime)')
+                if last_event_ms and last_event_ms != 'NULL' and last_event_ms is not None:
                     try:
                         last_seen = datetime.fromtimestamp(last_event_ms / 1000).strftime('%Y-%m-%d %H:%M:%S')
                         
@@ -248,39 +241,32 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
                     except (ValueError, TypeError) as e:
                         print(f"   ⚠️ Error parsing timestamp: {e}")
                         last_seen = 'Invalid timestamp'
-                
-                # Get event count
-                event_count_30d = event_data.get('event_count', 0)
-                if event_count_30d == 'NULL':
-                    event_count_30d = 0
-                    
+                else:
+                    last_seen = 'No events in last 30 days'
+                    activity_status = 'No Activity'
             else:
                 last_seen = 'No events in last 30 days'
-                event_count_30d = 0
+                activity_status = 'No Activity'
+        else:
+            last_seen = 'AQL search failed'
+            activity_status = 'Unknown'
         
-        # Execute second query (recent activity)
-        search_id = _start_aql_search(qradar_host, username, password, queries[1])
-        if search_id:
-            results = _get_search_results(qradar_host, username, password, search_id)
-            events = results.get('events', [])
-            
-            if events and len(events) > 0:
-                recent_event_count = events[0].get('recent_count', 0)
-                if recent_event_count == 'NULL':
-                    recent_event_count = 0
+        # Get event count with a separate simple query if needed
+        if activity_status != 'No Activity':
+            count_query = f"SELECT COUNT(*) FROM events WHERE logsourceid={ls_id} LAST 30 DAYS"
+            search_id = _start_aql_search(qradar_host, username, password, count_query)
+            if search_id:
+                results = _get_search_results(qradar_host, username, password, search_id)
+                events = results.get('events', [])
+                if events and len(events) > 0:
+                    event_count_30d = events[0].get('COUNT(*)', 0)
+                    if event_count_30d == 'NULL':
+                        event_count_30d = 0
         
         # Calculate average EPS over 30 days
         average_eps = round(event_count_30d / (30 * 24 * 3600), 2) if event_count_30d > 0 else 0
-        
-        # Final activity determination
-        if recent_event_count > 0:
-            activity_status = 'Active'
-        elif event_count_30d > 0:
-            activity_status = 'Inactive'
-        else:
-            activity_status = 'No Activity'
             
-        print(f"   📊 Events: {event_count_30d} (30d), {recent_event_count} ({ACTIVITY_THRESHOLD_DAYS}d), Status: {activity_status}")
+        print(f"   📊 Events: {event_count_30d} (30d), Status: {activity_status}")
 
         return {
             'status': 'Found',
