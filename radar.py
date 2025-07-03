@@ -71,12 +71,10 @@ def _empty_details():
     """Return empty details structure with proper data types"""
     return {
         'qradar_id': '',
-        'protocol_type': '',
         'enabled': '',
         'last_seen': '',
         'activity_status': '',
-        'last_event_time_seconds': 0,
-        'average_eps': 0.0
+        'days_since_last_event': 0
     }
 
 
@@ -84,9 +82,10 @@ def safe_timestamp_conversion(timestamp_ms):
     """
     Safely convert timestamp to datetime string with proper validation
     QRadar returns timestamps in milliseconds, so we need to divide by 1000
+    Returns: (last_seen_str, activity_status, days_since_last_event)
     """
     if not timestamp_ms:
-        return 'No events recorded', 'No Activity'
+        return 'No events recorded', 'No Activity', 0
     
     try:
         # Convert to int if it's a float
@@ -104,11 +103,16 @@ def safe_timestamp_conversion(timestamp_ms):
         # Validate timestamp is within reasonable range (after conversion)
         if timestamp_seconds <= MIN_TIMESTAMP or timestamp_seconds > MAX_TIMESTAMP:
             print(f"   ⚠️ Timestamp out of valid range: {timestamp_seconds}")
-            return f'Invalid timestamp: {timestamp_ms}', 'Unknown'
+            return f'Invalid timestamp: {timestamp_ms}', 'Unknown', 0
         
         # Convert to datetime
         last_event_datetime = datetime.fromtimestamp(timestamp_seconds)
         last_seen = last_event_datetime.strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Calculate days since last event
+        current_time = datetime.now()
+        time_diff = current_time - last_event_datetime
+        days_since_last_event = time_diff.days
         
         # Check if recent enough to be considered active
         threshold_time = datetime.now() - timedelta(days=ACTIVITY_THRESHOLD_DAYS)
@@ -118,11 +122,11 @@ def safe_timestamp_conversion(timestamp_ms):
         else:
             activity_status = 'Inactive'
             
-        return last_seen, activity_status
+        return last_seen, activity_status, days_since_last_event
         
     except (ValueError, TypeError, OSError, OverflowError) as e:
         print(f"   ⚠️ Error parsing timestamp {timestamp_ms}: {e}")
-        return f'Invalid timestamp: {timestamp_ms}', 'Unknown'
+        return f'Invalid timestamp: {timestamp_ms}', 'Unknown', 0
 
 
 def get_log_source_details(qradar_host, username, password, identifier, is_ip=False):
@@ -163,39 +167,23 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
         last_event_time_ms = log_source.get('last_event_time')
         
         # Use safe timestamp conversion (handles milliseconds to seconds conversion)
-        last_seen, activity_status = safe_timestamp_conversion(last_event_time_ms)
+        last_seen, activity_status, days_since_last_event = safe_timestamp_conversion(last_event_time_ms)
         
         # Get additional useful fields from the API
         enabled = log_source.get('enabled', False)
-        protocol_type = log_source.get('protocol_type', '')
-        average_eps = log_source.get('average_eps', 0)
-        
-        # Ensure average_eps is a float
-        try:
-            average_eps = float(average_eps) if average_eps is not None else 0.0
-        except (ValueError, TypeError):
-            average_eps = 0.0
         
         # Get status string for enabled - ensure it's a string
         enabled_str = 'Yes' if enabled else 'No'
-        
-        # Ensure last_event_time_ms is stored as original value for reference
-        try:
-            last_event_time_stored = int(last_event_time_ms) if last_event_time_ms is not None else 0
-        except (ValueError, TypeError):
-            last_event_time_stored = 0
             
-        print(f"   📊 Last Event: {last_seen} | Status: {activity_status} | Enabled: {enabled_str}")
+        print(f"   📊 Last Event: {last_seen} | Status: {activity_status} | Enabled: {enabled_str} | Days Since: {days_since_last_event}")
 
         return {
             'status': 'Found',
             'qradar_id': str(ls_id) if ls_id is not None else '',
-            'protocol_type': str(protocol_type) if protocol_type is not None else '',
             'enabled': enabled_str,
             'last_seen': last_seen,
             'activity_status': activity_status,
-            'last_event_time_seconds': last_event_time_stored,
-            'average_eps': average_eps
+            'days_since_last_event': days_since_last_event
         }
 
     except Exception as e:
@@ -222,12 +210,10 @@ def process_sheet(df, sheet_name, qradar_host, username, password, logsource_col
     result_columns_config = {
         'status': 'object',
         'qradar_id': 'object', 
-        'protocol_type': 'object',
         'enabled': 'object',
         'last_seen': 'object',
         'activity_status': 'object',
-        'last_event_time_seconds': 'int64',
-        'average_eps': 'float64'
+        'days_since_last_event': 'int64'
     }
     
     for col, dtype in result_columns_config.items():
@@ -276,7 +262,7 @@ def process_sheet(df, sheet_name, qradar_host, username, password, logsource_col
         if details['status'] == 'Found':
             found_count += 1
             
-        print(f"   ✅ Result: {details['status']} | Activity: {details['activity_status']} | Last Event: {details.get('last_seen', 'N/A')}")
+        print(f"   ✅ Result: {details['status']} | Activity: {details['activity_status']} | Last Event: {details.get('last_seen', 'N/A')} | Days Since: {details.get('days_since_last_event', 'N/A')}")
         
         # Add delay to avoid overwhelming QRadar
         time.sleep(0.5)
