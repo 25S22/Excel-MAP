@@ -80,22 +80,31 @@ def _empty_details():
     }
 
 
-def safe_timestamp_conversion(timestamp_seconds):
+def safe_timestamp_conversion(timestamp_ms):
     """
     Safely convert timestamp to datetime string with proper validation
+    QRadar returns timestamps in milliseconds, so we need to divide by 1000
     """
-    if not timestamp_seconds:
+    if not timestamp_ms:
         return 'No events recorded', 'No Activity'
     
     try:
         # Convert to int if it's a float
-        if isinstance(timestamp_seconds, float):
-            timestamp_seconds = int(timestamp_seconds)
+        if isinstance(timestamp_ms, float):
+            timestamp_ms = int(timestamp_ms)
         
-        # Validate timestamp is within reasonable range
+        # Check if timestamp looks like milliseconds (> year 2100 in seconds)
+        # If it's a very large number, it's likely milliseconds
+        if timestamp_ms > 4102444800:  # Year 2100 in seconds
+            print(f"   📅 Converting milliseconds to seconds: {timestamp_ms}")
+            timestamp_seconds = timestamp_ms / 1000.0
+        else:
+            timestamp_seconds = timestamp_ms
+        
+        # Validate timestamp is within reasonable range (after conversion)
         if timestamp_seconds <= MIN_TIMESTAMP or timestamp_seconds > MAX_TIMESTAMP:
             print(f"   ⚠️ Timestamp out of valid range: {timestamp_seconds}")
-            return f'Invalid timestamp: {timestamp_seconds}', 'Unknown'
+            return f'Invalid timestamp: {timestamp_ms}', 'Unknown'
         
         # Convert to datetime
         last_event_datetime = datetime.fromtimestamp(timestamp_seconds)
@@ -112,8 +121,8 @@ def safe_timestamp_conversion(timestamp_seconds):
         return last_seen, activity_status
         
     except (ValueError, TypeError, OSError, OverflowError) as e:
-        print(f"   ⚠️ Error parsing timestamp {timestamp_seconds}: {e}")
-        return f'Invalid timestamp: {timestamp_seconds}', 'Unknown'
+        print(f"   ⚠️ Error parsing timestamp {timestamp_ms}: {e}")
+        return f'Invalid timestamp: {timestamp_ms}', 'Unknown'
 
 
 def get_log_source_details(qradar_host, username, password, identifier, is_ip=False):
@@ -150,11 +159,11 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
         
         print(f"   📋 Found log source: {ls_name} (ID: {ls_id})")
 
-        # Get last_event_time directly from the API response (in seconds)
-        last_event_time_seconds = log_source.get('last_event_time')
+        # Get last_event_time directly from the API response (in milliseconds)
+        last_event_time_ms = log_source.get('last_event_time')
         
-        # Use safe timestamp conversion
-        last_seen, activity_status = safe_timestamp_conversion(last_event_time_seconds)
+        # Use safe timestamp conversion (handles milliseconds to seconds conversion)
+        last_seen, activity_status = safe_timestamp_conversion(last_event_time_ms)
         
         # Get additional useful fields from the API
         enabled = log_source.get('enabled', False)
@@ -170,11 +179,11 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
         # Get status string for enabled - ensure it's a string
         enabled_str = 'Yes' if enabled else 'No'
         
-        # Ensure last_event_time_seconds is an integer
+        # Ensure last_event_time_ms is stored as original value for reference
         try:
-            last_event_time_seconds = int(last_event_time_seconds) if last_event_time_seconds is not None else 0
+            last_event_time_stored = int(last_event_time_ms) if last_event_time_ms is not None else 0
         except (ValueError, TypeError):
-            last_event_time_seconds = 0
+            last_event_time_stored = 0
             
         print(f"   📊 Last Event: {last_seen} | Status: {activity_status} | Enabled: {enabled_str}")
 
@@ -185,7 +194,7 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
             'enabled': enabled_str,
             'last_seen': last_seen,
             'activity_status': activity_status,
-            'last_event_time_seconds': last_event_time_seconds,
+            'last_event_time_seconds': last_event_time_stored,
             'average_eps': average_eps
         }
 
