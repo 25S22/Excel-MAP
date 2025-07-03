@@ -6,6 +6,7 @@ import time
 import os
 import json
 import win32com.client  # For creating draft emails in Outlook
+import numpy as np
 
 # ─── CONFIGURATION ─────────────────────────────────────────────────────────────
 INPUT_EXCEL_PATH = r'C:\path\to\your\input.xlsx'
@@ -21,6 +22,10 @@ ACTIVITY_THRESHOLD_DAYS = 7  # Consider log source inactive if no events in X da
 REQUEST_TIMEOUT = 30
 MAX_SEARCH_RETRIES = 20  # Increased from 10
 SEARCH_RETRY_DELAY = 3   # Increased from 2
+
+# Valid timestamp range (avoid dates before 1970 and after 2038 for 32-bit systems)
+MIN_TIMESTAMP = 0  # Unix epoch start
+MAX_TIMESTAMP = 2147483647  # 2038-01-19 (32-bit limit)
 # ─── END CONFIGURATION ─────────────────────────────────────────────────────────
 
 
@@ -63,7 +68,7 @@ def test_qradar_connection(qradar_host, username, password):
 
 
 def _empty_details():
-    """Return empty details structure"""
+    """Return empty details structure with proper data types"""
     return {
         'qradar_id': '',
         'protocol_type': '',
@@ -71,11 +76,44 @@ def _empty_details():
         'last_seen': '',
         'activity_status': '',
         'last_event_time_seconds': 0,
-        'average_eps': 0
+        'average_eps': 0.0
     }
 
 
-# AQL functions removed - no longer needed since log source API provides last_event_time directly
+def safe_timestamp_conversion(timestamp_seconds):
+    """
+    Safely convert timestamp to datetime string with proper validation
+    """
+    if not timestamp_seconds:
+        return 'No events recorded', 'No Activity'
+    
+    try:
+        # Convert to int if it's a float
+        if isinstance(timestamp_seconds, float):
+            timestamp_seconds = int(timestamp_seconds)
+        
+        # Validate timestamp is within reasonable range
+        if timestamp_seconds <= MIN_TIMESTAMP or timestamp_seconds > MAX_TIMESTAMP:
+            print(f"   ⚠️ Timestamp out of valid range: {timestamp_seconds}")
+            return f'Invalid timestamp: {timestamp_seconds}', 'Unknown'
+        
+        # Convert to datetime
+        last_event_datetime = datetime.fromtimestamp(timestamp_seconds)
+        last_seen = last_event_datetime.strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Check if recent enough to be considered active
+        threshold_time = datetime.now() - timedelta(days=ACTIVITY_THRESHOLD_DAYS)
+        
+        if last_event_datetime > threshold_time:
+            activity_status = 'Active'
+        else:
+            activity_status = 'Inactive'
+            
+        return last_seen, activity_status
+        
+    except (ValueError, TypeError, OSError, OverflowError) as e:
+        print(f"   ⚠️ Error parsing timestamp {timestamp_seconds}: {e}")
+        return f'Invalid timestamp: {timestamp_seconds}', 'Unknown'
 
 
 def get_log_source_details(qradar_host, username, password, identifier, is_ip=False):
@@ -115,45 +153,35 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
         # Get last_event_time directly from the API response (in seconds)
         last_event_time_seconds = log_source.get('last_event_time')
         
-        last_seen = ''
-        activity_status = 'No Activity'
-        
-        if last_event_time_seconds and last_event_time_seconds != 0:
-            try:
-                # Convert seconds to datetime
-                last_event_datetime = datetime.fromtimestamp(last_event_time_seconds)
-                last_seen = last_event_datetime.strftime('%Y-%m-%d %H:%M:%S')
-                
-                # Check if recent enough to be considered active
-                threshold_time = datetime.now() - timedelta(days=ACTIVITY_THRESHOLD_DAYS)
-                
-                if last_event_datetime > threshold_time:
-                    activity_status = 'Active'
-                else:
-                    activity_status = 'Inactive'
-                    
-            except (ValueError, TypeError, OSError) as e:
-                print(f"   ⚠️ Error parsing timestamp: {e}")
-                last_seen = f'Invalid timestamp: {last_event_time_seconds}'
-                activity_status = 'Unknown'
-        else:
-            last_seen = 'No events recorded'
-            activity_status = 'No Activity'
+        # Use safe timestamp conversion
+        last_seen, activity_status = safe_timestamp_conversion(last_event_time_seconds)
         
         # Get additional useful fields from the API
         enabled = log_source.get('enabled', False)
         protocol_type = log_source.get('protocol_type', '')
         average_eps = log_source.get('average_eps', 0)
         
-        # Get status string for enabled
+        # Ensure average_eps is a float
+        try:
+            average_eps = float(average_eps) if average_eps is not None else 0.0
+        except (ValueError, TypeError):
+            average_eps = 0.0
+        
+        # Get status string for enabled - ensure it's a string
         enabled_str = 'Yes' if enabled else 'No'
+        
+        # Ensure last_event_time_seconds is an integer
+        try:
+            last_event_time_seconds = int(last_event_time_seconds) if last_event_time_seconds is not None else 0
+        except (ValueError, TypeError):
+            last_event_time_seconds = 0
             
         print(f"   📊 Last Event: {last_seen} | Status: {activity_status} | Enabled: {enabled_str}")
 
         return {
             'status': 'Found',
-            'qradar_id': ls_id,
-            'protocol_type': protocol_type,
+            'qradar_id': str(ls_id) if ls_id is not None else '',
+            'protocol_type': str(protocol_type) if protocol_type is not None else '',
             'enabled': enabled_str,
             'last_seen': last_seen,
             'activity_status': activity_status,
@@ -181,11 +209,26 @@ def process_sheet(df, sheet_name, qradar_host, username, password, logsource_col
         print(f"   Available columns: {list(df.columns)}")
         return df
     
-    # Add result columns if they don't exist
-    result_columns = ['status', 'qradar_id', 'protocol_type', 'enabled', 'last_seen', 'activity_status', 'last_event_time_seconds', 'average_eps']
-    for col in result_columns:
+    # Add result columns if they don't exist with proper data types
+    result_columns_config = {
+        'status': 'object',
+        'qradar_id': 'object', 
+        'protocol_type': 'object',
+        'enabled': 'object',
+        'last_seen': 'object',
+        'activity_status': 'object',
+        'last_event_time_seconds': 'int64',
+        'average_eps': 'float64'
+    }
+    
+    for col, dtype in result_columns_config.items():
         if col not in df.columns:
-            df[col] = ''
+            if dtype == 'object':
+                df[col] = pd.Series(dtype=object)
+            elif dtype == 'int64':
+                df[col] = pd.Series(dtype='int64')
+            elif dtype == 'float64':
+                df[col] = pd.Series(dtype='float64')
     
     total = len(df)
     processed = 0
@@ -216,9 +259,10 @@ def process_sheet(df, sheet_name, qradar_host, username, password, logsource_col
         if not details:
             details = {'status': 'Empty/Invalid', **_empty_details()}
         
-        # Update DataFrame
+        # Update DataFrame with proper data type handling
         for k, v in details.items():
-            df.at[idx, k] = v
+            # Use .loc to avoid the FutureWarning about incompatible dtypes
+            df.loc[idx, k] = v
         
         if details['status'] == 'Found':
             found_count += 1
