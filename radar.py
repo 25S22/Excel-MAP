@@ -70,120 +70,25 @@ def _empty_details():
         'enabled': '',
         'last_seen': '',
         'activity_status': '',
-        'event_count_30d': 0,
+        'last_event_time_seconds': 0,
         'average_eps': 0
     }
 
 
-def _start_aql_search(qradar_host, username, password, query):
-    """Start an AQL search and return search ID"""
-    endpoint = f"{qradar_host.rstrip('/')}/api/ariel/searches"
-    
-    try:
-        print(f"   🔍 Executing AQL: {query}")
-        
-        resp = requests.post(
-            endpoint,
-            auth=(username, password),
-            verify=VERIFY_SSL,
-            timeout=REQUEST_TIMEOUT,
-            headers={
-                'Accept': 'application/json',
-                'Content-Type': 'application/json',
-                'Version': '14.0'  # Added API version
-            },
-            json={'query_expression': query}
-        )
-        
-        if resp.status_code == 201:
-            search_data = resp.json()
-            search_id = search_data.get('search_id')
-            print(f"   ✅ Search started with ID: {search_id}")
-            return search_id
-        else:
-            print(f"   ❌ Failed to start search: {resp.status_code} - {resp.text}")
-            return None
-            
-    except Exception as e:
-        print(f"   ❌ AQL search error: {e}")
-        return None
-
-
-def _get_search_results(qradar_host, username, password, search_id):
-    """Get search results with improved error handling and status checking"""
-    endpoint = f"{qradar_host.rstrip('/')}/api/ariel/searches/{search_id}/results"
-    status_endpoint = f"{qradar_host.rstrip('/')}/api/ariel/searches/{search_id}"
-    
-    print(f"   ⏳ Waiting for search {search_id} to complete...")
-    
-    for attempt in range(MAX_SEARCH_RETRIES):
-        try:
-            # Check search status first
-            status_resp = requests.get(
-                status_endpoint,
-                auth=(username, password),
-                verify=VERIFY_SSL,
-                timeout=REQUEST_TIMEOUT,
-                headers={'Accept': 'application/json', 'Version': '14.0'}
-            )
-            
-            if status_resp.status_code == 200:
-                status_data = status_resp.json()
-                search_status = status_data.get('status', 'UNKNOWN')
-                
-                print(f"   📊 Search status: {search_status} (attempt {attempt + 1}/{MAX_SEARCH_RETRIES})")
-                
-                if search_status == 'COMPLETED':
-                    # Get results
-                    results_resp = requests.get(
-                        endpoint,
-                        auth=(username, password),
-                        verify=VERIFY_SSL,
-                        timeout=REQUEST_TIMEOUT,
-                        headers={'Accept': 'application/json', 'Version': '14.0'}
-                    )
-                    
-                    if results_resp.status_code == 200:
-                        data = results_resp.json()
-                        print(f"   ✅ Search completed successfully")
-                        return data
-                    else:
-                        print(f"   ❌ Failed to get results: {results_resp.status_code}")
-                        return {}
-                        
-                elif search_status == 'ERROR':
-                    print(f"   ❌ Search failed with error")
-                    return {}
-                
-                elif search_status in ['WAIT', 'EXECUTE', 'SORTING']:
-                    time.sleep(SEARCH_RETRY_DELAY)
-                    continue
-                else:
-                    print(f"   ⚠️ Unknown search status: {search_status}")
-                    time.sleep(SEARCH_RETRY_DELAY)
-                    
-            else:
-                print(f"   ❌ Failed to check search status: {status_resp.status_code}")
-                time.sleep(SEARCH_RETRY_DELAY)
-                
-        except Exception as e:
-            print(f"   ❌ Error checking search results: {e}")
-            time.sleep(SEARCH_RETRY_DELAY)
-    
-    print(f"   ⏰ Search timed out after {MAX_SEARCH_RETRIES} attempts")
-    return {}
+# AQL functions removed - no longer needed since log source API provides last_event_time directly
 
 
 def get_log_source_details(qradar_host, username, password, identifier, is_ip=False):
     """
-    Enhanced log source lookup with better activity detection
+    Get log source details directly from the API - no AQL needed!
+    The API returns last_event_time directly.
     """
     filter_key = 'ip_address' if is_ip else 'name'
     query_filter = f'{filter_key}="{identifier}"'
     ls_endpoint = f"{qradar_host.rstrip('/')}/api/config/event_sources/log_source_management/log_sources"
 
     try:
-        # Get log source details
+        # Get log source details with all fields
         resp = requests.get(
             ls_endpoint,
             params={'filter': query_filter},
@@ -207,75 +112,52 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
         
         print(f"   📋 Found log source: {ls_name} (ID: {ls_id})")
 
-        # Simple AQL query - just get the last event timestamp
-        aql_query = f"SELECT MAX(starttime) FROM events WHERE logsourceid={ls_id} LAST 30 DAYS"
+        # Get last_event_time directly from the API response (in seconds)
+        last_event_time_seconds = log_source.get('last_event_time')
         
         last_seen = ''
         activity_status = 'No Activity'
-        event_count_30d = 0
         
-        # Execute the single AQL query
-        search_id = _start_aql_search(qradar_host, username, password, aql_query)
-        if search_id:
-            results = _get_search_results(qradar_host, username, password, search_id)
-            events = results.get('events', [])
-            
-            if events and len(events) > 0:
-                event_data = events[0]
+        if last_event_time_seconds and last_event_time_seconds != 0:
+            try:
+                # Convert seconds to datetime
+                last_event_datetime = datetime.fromtimestamp(last_event_time_seconds)
+                last_seen = last_event_datetime.strftime('%Y-%m-%d %H:%M:%S')
                 
-                # Get last event timestamp
-                last_event_ms = event_data.get('MAX(starttime)')
-                if last_event_ms and last_event_ms != 'NULL' and last_event_ms is not None:
-                    try:
-                        last_seen = datetime.fromtimestamp(last_event_ms / 1000).strftime('%Y-%m-%d %H:%M:%S')
-                        
-                        # Check if recent enough to be considered active
-                        last_event_time = datetime.fromtimestamp(last_event_ms / 1000)
-                        threshold_time = datetime.now() - timedelta(days=ACTIVITY_THRESHOLD_DAYS)
-                        
-                        if last_event_time > threshold_time:
-                            activity_status = 'Active'
-                        else:
-                            activity_status = 'Inactive'
-                            
-                    except (ValueError, TypeError) as e:
-                        print(f"   ⚠️ Error parsing timestamp: {e}")
-                        last_seen = 'Invalid timestamp'
+                # Check if recent enough to be considered active
+                threshold_time = datetime.now() - timedelta(days=ACTIVITY_THRESHOLD_DAYS)
+                
+                if last_event_datetime > threshold_time:
+                    activity_status = 'Active'
                 else:
-                    last_seen = 'No events in last 30 days'
-                    activity_status = 'No Activity'
-            else:
-                last_seen = 'No events in last 30 days'
-                activity_status = 'No Activity'
+                    activity_status = 'Inactive'
+                    
+            except (ValueError, TypeError, OSError) as e:
+                print(f"   ⚠️ Error parsing timestamp: {e}")
+                last_seen = f'Invalid timestamp: {last_event_time_seconds}'
+                activity_status = 'Unknown'
         else:
-            last_seen = 'AQL search failed'
-            activity_status = 'Unknown'
+            last_seen = 'No events recorded'
+            activity_status = 'No Activity'
         
-        # Get event count with a separate simple query if needed
-        if activity_status != 'No Activity':
-            count_query = f"SELECT COUNT(*) FROM events WHERE logsourceid={ls_id} LAST 30 DAYS"
-            search_id = _start_aql_search(qradar_host, username, password, count_query)
-            if search_id:
-                results = _get_search_results(qradar_host, username, password, search_id)
-                events = results.get('events', [])
-                if events and len(events) > 0:
-                    event_count_30d = events[0].get('COUNT(*)', 0)
-                    if event_count_30d == 'NULL':
-                        event_count_30d = 0
+        # Get additional useful fields from the API
+        enabled = log_source.get('enabled', False)
+        protocol_type = log_source.get('protocol_type', '')
+        average_eps = log_source.get('average_eps', 0)
         
-        # Calculate average EPS over 30 days
-        average_eps = round(event_count_30d / (30 * 24 * 3600), 2) if event_count_30d > 0 else 0
+        # Get status string for enabled
+        enabled_str = 'Yes' if enabled else 'No'
             
-        print(f"   📊 Events: {event_count_30d} (30d), Status: {activity_status}")
+        print(f"   📊 Last Event: {last_seen} | Status: {activity_status} | Enabled: {enabled_str}")
 
         return {
             'status': 'Found',
             'qradar_id': ls_id,
-            'protocol_type': log_source.get('protocol_type', ''),
-            'enabled': log_source.get('enabled', ''),
+            'protocol_type': protocol_type,
+            'enabled': enabled_str,
             'last_seen': last_seen,
             'activity_status': activity_status,
-            'event_count_30d': event_count_30d,
+            'last_event_time_seconds': last_event_time_seconds,
             'average_eps': average_eps
         }
 
@@ -300,7 +182,7 @@ def process_sheet(df, sheet_name, qradar_host, username, password, logsource_col
         return df
     
     # Add result columns if they don't exist
-    result_columns = ['status', 'qradar_id', 'protocol_type', 'enabled', 'last_seen', 'activity_status', 'event_count_30d', 'average_eps']
+    result_columns = ['status', 'qradar_id', 'protocol_type', 'enabled', 'last_seen', 'activity_status', 'last_event_time_seconds', 'average_eps']
     for col in result_columns:
         if col not in df.columns:
             df[col] = ''
@@ -341,7 +223,7 @@ def process_sheet(df, sheet_name, qradar_host, username, password, logsource_col
         if details['status'] == 'Found':
             found_count += 1
             
-        print(f"   ✅ Result: {details['status']} | Activity: {details['activity_status']} | Events: {details.get('event_count_30d', 0)}")
+        print(f"   ✅ Result: {details['status']} | Activity: {details['activity_status']} | Last Event: {details.get('last_seen', 'N/A')}")
         
         # Add delay to avoid overwhelming QRadar
         time.sleep(0.5)
