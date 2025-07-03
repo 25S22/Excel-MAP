@@ -18,14 +18,19 @@ VERIFY_SSL = False
 DRAFT_OUTPUT_PATH = os.path.join(os.path.dirname(INPUT_EXCEL_PATH), 'inactive_and_errors.xlsx')
 # ─── END CONFIGURATION ─────────────────────────────────────────────────────────
 
+
 def test_qradar_connection(qradar_host, username, password):
-    """Test if we can connect to the QRadar API."""
     print("🔗 Testing QRadar connection...")
     qradar_host = qradar_host.rstrip('/')
     endpoint = f"{qradar_host}/api/help/versions"
     try:
-        resp = requests.get(endpoint, auth=(username, password), verify=VERIFY_SSL,
-                            timeout=10, headers={'Accept': 'application/json'})
+        resp = requests.get(
+            endpoint,
+            auth=(username, password),
+            verify=VERIFY_SSL,
+            timeout=10,
+            headers={'Accept': 'application/json'}
+        )
         if resp.status_code == 200:
             print("✅ QRadar connection successful!")
             return True
@@ -48,7 +53,9 @@ def _start_aql_search(qradar_host, username, password, query):
     endpoint = f"{qradar_host.rstrip('/')}/api/ariel/searches"
     try:
         resp = requests.post(
-            endpoint, auth=(username, password), verify=VERIFY_SSL,
+            endpoint,
+            auth=(username, password),
+            verify=VERIFY_SSL,
             timeout=30,
             headers={'Accept': 'application/json', 'Content-Type': 'application/json'},
             json={'query_expression': query}
@@ -65,7 +72,9 @@ def _get_search_results(qradar_host, username, password, search_id):
     for _ in range(10):
         time.sleep(2)
         resp = requests.get(
-            endpoint, auth=(username, password), verify=VERIFY_SSL,
+            endpoint,
+            auth=(username, password),
+            verify=VERIFY_SSL,
             timeout=30,
             headers={'Accept': 'application/json'}
         )
@@ -77,14 +86,22 @@ def _get_search_results(qradar_host, username, password, search_id):
 
 
 def get_log_source_details(qradar_host, username, password, identifier, is_ip=False):
+    """
+    Lookup a log source by name or IP and return its details,
+    including the actual last event timestamp.
+    """
     filter_key = 'ip_address' if is_ip else 'name'
     query_filter = f'{filter_key}="{identifier}"'
     ls_endpoint = f"{qradar_host.rstrip('/')}/api/config/event_sources/log_source_management/log_sources"
+
     try:
         resp = requests.get(
-            ls_endpoint, params={'filter': query_filter},
-            auth=(username, password), verify=VERIFY_SSL,
-            timeout=30, headers={'Accept': 'application/json'}
+            ls_endpoint,
+            params={'filter': query_filter},
+            auth=(username, password),
+            verify=VERIFY_SSL,
+            timeout=30,
+            headers={'Accept': 'application/json'}
         )
         if resp.status_code != 200:
             return {'status': f'API Error {resp.status_code}', **_empty_details()}
@@ -96,11 +113,13 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
         log_source = ls_data[0]
         ls_id = log_source.get('id')
 
+        # Build AQL to get the MAX(starttime) for last 30 days
         aql = f"SELECT MAX(starttime) FROM events WHERE logsourceid={ls_id} LAST 30 DAYS"
         search_id = _start_aql_search(qradar_host, username, password, aql)
 
-        last_seen = 'No events in last 30 days'
-        activity_status = 'Inactive'
+        last_seen = ''
+        activity_status = 'No Activity'
+
         if search_id:
             results = _get_search_results(qradar_host, username, password, search_id)
             events = results.get('events', [])
@@ -108,6 +127,8 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
                 epoch_ms = events[0]['MAX(starttime)']
                 last_seen = datetime.fromtimestamp(epoch_ms / 1000).strftime('%Y-%m-%d %H:%M:%S')
                 activity_status = 'Active'
+            else:
+                last_seen = 'No events in last 30 days'
 
         return {
             'status': 'Found',
@@ -117,6 +138,7 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
             'last_seen': last_seen,
             'activity_status': activity_status
         }
+
     except Exception as e:
         return {'status': f'Error: {e}', **_empty_details()}
 
@@ -127,36 +149,28 @@ def process_sheet(df, sheet_name, qradar_host, username, password, logsource_col
         if col not in df.columns:
             print(f"❌ Column '{col}' not found in {sheet_name}! Available: {list(df.columns)}")
             return df
-
-    # Ensure result columns exist
     for col in ['status', 'qradar_id', 'protocol_type', 'enabled', 'last_seen', 'activity_status']:
         if col not in df.columns:
             df[col] = ''
-
     total = len(df)
     print(f"Found {total} rows to process...")
     for idx, row in df.iterrows():
         name_val = str(row[logsource_column]).strip()
         details = None
-        if name_val:
+        if name_val and name_val.lower() not in ['nan', 'none', '']:
             print(f"[{idx+1}/{total}] Lookup by name: {name_val}")
             details = get_log_source_details(qradar_host, username, password, name_val, is_ip=False)
-
         if not details or details['status'] == 'Not Found':
             ip_val = str(row[ip_column]).strip()
-            if ip_val:
+            if ip_val and ip_val.lower() not in ['nan', 'none', '']:
                 print(f"   🔁 Fallback to IP: {ip_val}")
                 details = get_log_source_details(qradar_host, username, password, ip_val, is_ip=True)
-
         if not details:
             details = {'status': 'Empty/Invalid', **_empty_details()}
-
-        # Write back and log
         for k, v in details.items():
             df.at[idx, k] = v
-        print(f"   → Status: {details['status']} | Last Seen: {details['last_seen']} | Activity: {details['activity_status']}")
+        print(f"   → {details['status']} | Last Seen: {details['last_seen']} | Activity: {details['activity_status']}")
         time.sleep(0.5)
-
     return df
 
 
@@ -177,14 +191,12 @@ def filter_and_email(df_dict, draft_path):
             mask_inactive = df['activity_status'] != 'Active'
             mask_errors = df['status'].str.startswith('API Error')
 
-            # Inactive rows
             if mask_inactive.any():
                 sub = df[mask_inactive].copy()
-                sub['remark'] = ''  # no remark for just inactive
+                sub['remark'] = ''
                 sub['sheet_name'] = name
                 frames.append(sub)
 
-            # API error rows
             if mask_errors.any():
                 sub_err = df[mask_errors].copy()
                 sub_err['remark'] = 'Check log source name'
@@ -206,13 +218,9 @@ def filter_and_email(df_dict, draft_path):
     subject = "Inactive Log Sources"
     body = (
         f"Hello,\n\n"
-        f"Attached is the QRadar log source report as of {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.\n"
-        f"Total flagged rows: {total}\n"
-        f"Inactive: {inactive_count}\n"
-        f"API errors: {error_count}\n\n"
-        "Remarks are added only for API errors.\n\n"
-        "Best regards,\n"
-        "QRadar Automation Bot"
+        f"Attached is the QRadar log source report as of {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.
+Attached: {total} flagged rows (Inactive: {inactive_count}, API errors: {error_count}).\n
+Remarks only for API errors.\n\nBest regards,\nQRadar Automation Bot"
     )
     create_outlook_draft(draft_path, subject, body)
 
@@ -253,9 +261,8 @@ def main():
         df = all_sheets.get(sheet)
         if df is not None:
             print(
-                f"\n📊 Summary for {sheet}: Found={df['status'].eq('Found').sum()}, "
-                f"Inactive={df['activity_status'].eq('Inactive').sum()}, "
-                f"Errors={df['status'].str.startswith('API Error').sum()}"
+                f"\n📊 Summary for {sheet}: Found={df['status'].eq('Found').sum()}, \
+                    Inactive={df['activity_status'].eq('Inactive').sum()}, API Errors={df['status'].str.startswith('API Error').sum()}"
             )
 
 if __name__ == '__main__':
