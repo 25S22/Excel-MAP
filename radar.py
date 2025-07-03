@@ -74,6 +74,8 @@ def _empty_details():
 
 def _start_aql_search(qradar_host, username, password, query):
     endpoint = f"{qradar_host.rstrip('/')}/api/ariel/searches"
+    print(f"      Starting AQL: {query}")
+    
     try:
         resp = requests.post(
             endpoint,
@@ -83,28 +85,71 @@ def _start_aql_search(qradar_host, username, password, query):
             headers={'Accept': 'application/json', 'Content-Type': 'application/json'},
             json={'query_expression': query}
         )
+        
+        print(f"      AQL Start Response: {resp.status_code}")
         if resp.status_code == 201:
-            return resp.json().get('search_id')
-    except Exception:
-        pass
-    return None
+            response_data = resp.json()
+            search_id = response_data.get('search_id')
+            print(f"      Search ID: {search_id}")
+            return search_id
+        else:
+            print(f"      ❌ AQL Start Failed: {resp.status_code} - {resp.text}")
+            return None
+    except Exception as e:
+        print(f"      ❌ AQL Start Exception: {e}")
+        return None
 
 
 def _get_search_results(qradar_host, username, password, search_id):
-    endpoint = f"{qradar_host.rstrip('/')}/api/ariel/searches/{search_id}/results"
-    for _ in range(10):
-        time.sleep(2)
-        resp = requests.get(
-            endpoint,
+    # First check search status
+    status_endpoint = f"{qradar_host.rstrip('/')}/api/ariel/searches/{search_id}"
+    results_endpoint = f"{qradar_host.rstrip('/')}/api/ariel/searches/{search_id}/results"
+    
+    # Poll for search completion
+    for attempt in range(15):  # Increased from 10 to 15 attempts
+        time.sleep(3)  # Increased from 2 to 3 seconds
+        
+        # Check search status first
+        status_resp = requests.get(
+            status_endpoint,
             auth=(username, password),
             verify=VERIFY_SSL,
             timeout=30,
             headers={'Accept': 'application/json'}
         )
-        if resp.status_code == 200:
-            data = resp.json()
-            if 'events' in data:
-                return data
+        
+        if status_resp.status_code == 200:
+            status_data = status_resp.json()
+            search_status = status_data.get('status', '')
+            print(f"      AQL Search Status: {search_status} (attempt {attempt + 1})")
+            
+            if search_status == 'COMPLETED':
+                # Now get the results
+                results_resp = requests.get(
+                    results_endpoint,
+                    auth=(username, password),
+                    verify=VERIFY_SSL,
+                    timeout=30,
+                    headers={'Accept': 'application/json'}
+                )
+                
+                if results_resp.status_code == 200:
+                    results_data = results_resp.json()
+                    print(f"      AQL Results: {results_data}")
+                    return results_data
+                else:
+                    print(f"      ❌ Failed to get results: {results_resp.status_code}")
+                    return {}
+            
+            elif search_status in ['ERROR', 'CANCELED']:
+                print(f"      ❌ Search failed with status: {search_status}")
+                return {}
+            
+            # If status is WAIT or EXECUTE, continue polling
+        else:
+            print(f"      ❌ Failed to check status: {status_resp.status_code}")
+    
+    print("      ⏰ Search timed out")
     return {}
 
 
@@ -140,18 +185,46 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
         aql = f"SELECT MAX(starttime) FROM events WHERE logsourceid={ls_id} LAST 30 DAYS"
         search_id = _start_aql_search(qradar_host, username, password, aql)
 
-        last_seen = ''
+        # Default values
+        last_seen = 'No events in last 30 days'
         activity_status = 'Inactive'
 
         if search_id:
             results = _get_search_results(qradar_host, username, password, search_id)
+            print(f"      Raw AQL Results: {results}")
+            
             events = results.get('events', [])
-            if events and events[0].get('MAX(starttime)'):
-                epoch_ms = events[0]['MAX(starttime)']
-                last_seen = datetime.fromtimestamp(epoch_ms / 1000).strftime('%Y-%m-%d %H:%M:%S')
-                activity_status = 'Active'
+            print(f"      Events Array: {events}")
+            
+            if events:
+                first_event = events[0]
+                print(f"      First Event: {first_event}")
+                
+                # Try different possible key names for the MAX result
+                max_timestamp = None
+                possible_keys = ['MAX(starttime)', 'max_starttime', 'starttime']
+                
+                for key in possible_keys:
+                    if key in first_event and first_event[key]:
+                        max_timestamp = first_event[key]
+                        print(f"      Found timestamp with key '{key}': {max_timestamp}")
+                        break
+                
+                if max_timestamp:
+                    try:
+                        last_seen = datetime.fromtimestamp(max_timestamp / 1000).strftime('%Y-%m-%d %H:%M:%S')
+                        activity_status = 'Active'
+                        print(f"      Converted timestamp: {last_seen}")
+                    except Exception as e:
+                        print(f"      ❌ Timestamp conversion failed: {e}")
+                        last_seen = f'Invalid timestamp: {max_timestamp}'
+                else:
+                    print(f"      ❌ No valid timestamp found in event keys: {list(first_event.keys())}")
             else:
-                last_seen = 'No events in last 30 days'
+                print("      No events found in results")
+        else:
+            print("      AQL search failed to start")
+            last_seen = 'AQL search failed'
 
         return {
             'status': 'Found',
